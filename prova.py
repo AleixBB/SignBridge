@@ -81,30 +81,39 @@ with mp_holistic.Holistic(model_complexity=1, min_detection_confidence=0.5, min_
 
             if detected:
                 img_counter += 1
-                # Guardar foto y vector
-                cv2.imwrite(os.path.join(OUTPUT_FOLDER, f"{img_counter}.jpg"), frame)
-                vector_str = ",".join([f"{v:.4f}" for v in data_vector])
-                f.write(f"{img_counter}:[{vector_str}]\n")
 
                 # --- DIBUJO DEL BRAZO COMPLETO ---
                 idx_arm = [12, 14, 16] if results.right_hand_landmarks else [11, 13, 15]
                 p_pts = []
+
                 for i in idx_arm:
                     lm = results.pose_landmarks.landmark[i]
                     p_pts.append((int(lm.x * w), int(lm.y * h)))
 
-                # Dibujar articulaciones: Hombro(Amarillo), Codo(Verde), Muñeca(Azul)
-                cv2.circle(frame, p_pts[0], 12, (0, 255, 255), -1) # Hombro
-                cv2.circle(frame, p_pts[1], 12, (0, 255, 0), -1)   # Codo
-                cv2.circle(frame, p_pts[2], 12, (255, 0, 0), -1)   # Muñeca
-                
-                # Dibujar huesos del brazo
-                cv2.line(frame, p_pts[0], p_pts[1], (255, 255, 255), 4) # Hombro-Codo
-                cv2.line(frame, p_pts[1], p_pts[2], (255, 255, 255), 4) # Codo-Muñeca
+                # Dibujar articulaciones
+                cv2.circle(frame, p_pts[0], 12, (0, 255, 255), -1)  # Hombro
+                cv2.circle(frame, p_pts[1], 12, (0, 255, 0), -1)    # Codo
+                cv2.circle(frame, p_pts[2], 12, (255, 0, 0), -1)    # Muñeca
 
-                # Dibujar la mano
+                # Dibujar huesos
+                cv2.line(frame, p_pts[0], p_pts[1], (255, 255, 255), 4)
+                cv2.line(frame, p_pts[1], p_pts[2], (255, 255, 255), 4)
+
+                # Dibujar mano
                 hand_lms = results.right_hand_landmarks if results.right_hand_landmarks else results.left_hand_landmarks
-                mp_drawing.draw_landmarks(frame, hand_lms, mp_holistic.HAND_CONNECTIONS)
+
+                mp_drawing.draw_landmarks(
+                    frame,
+                    hand_lms,
+                    mp_holistic.HAND_CONNECTIONS
+                )
+
+                # --- AHORA GUARDAR IMAGEN CON LANDMARKS ---
+                cv2.imwrite(os.path.join(OUTPUT_FOLDER, f"{img_counter}.jpg"), frame)
+
+                # --- GUARDAR VECTOR ---
+                vector_str = ",".join([f"{v:.4f}" for v in data_vector])
+                f.write(f"{img_counter}:[{vector_str}]\n")
             else:
                 cv2.putText(frame, "BRAZO NO DETECTADO - ALEJATE MAS", (50, h-30), 0, 0.7, (0,0,255), 2)
 
