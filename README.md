@@ -1,0 +1,1 @@
+SignBridge es un proyecto dentro del marco de la asignatura Laboratori Integrat de Software de la UAB consistente en realizar una aplicación en grupos en nuestro caso un traductor de lenguaje de signos español a voz o texto en tiempo real.
