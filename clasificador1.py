@@ -1,47 +1,30 @@
 import cv2
 import mediapipe as mp
 import numpy as np
-from collections import deque
+from collections import deque, Counter
+import time
 
-# ==========================
-# FEATURES Y PESOS
-# ==========================
+DATASET_FILE = "dataset_lse.csv"
 
-NOMBRES_FEATURES = [
-    "flex_index_1","flex_index_2",
-    "flex_middle_1","flex_middle_2",
-    "flex_ring_1","flex_ring_2",
-    "flex_pinky_1","flex_pinky_2",
-    "flex_thumb",
-    "dist_index_middle",
-    "dist_middle_ring",
-    "dist_ring_pinky",
-    "dist_thumb_index",
-    "dist_thumb_middle",
-    "ext_index",
-    "ext_middle",
-    "ext_ring",
-    "ext_pinky",
-    "ext_thumb",
-    "palm_orientation_x",
-    "palm_orientation_y",
-    "palm_orientation_z",
-    "arm_length",
-    "forearm_length",
-    "elbow_angle"
-]
+CONFIDENCE_THRESHOLD = 80 
+STABILITY_FRAMES = 5
+COOLDOWN_FRAMES = 2
+K_NEIGHBORS = 7
+TEMPORAL_SMOOTHING = 4
 
-PESOS_FEATURES = np.array([
-    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,0.5,0.5,0.2,0.8,0.8,1.2
-])
+# pesos de features
+FEATURE_WEIGHTS = np.array(
+    [3]*9 +      # flexiones dedos
+    [2]*5 +      # distancias
+    [2]*5 +      # extensiones
+    [1]*3 +      # orientación
+    [0.5]*3      # brazo
+)
+
 
 # ==========================
 # FUNCIONES AUXILIARES
 # ==========================
-
-def espejo_x(x, flip):
-    return 1-x if flip else x
-
 
 def angulo(a,b,c):
     ba = a-b
@@ -109,65 +92,171 @@ def extraer_features(vector):
         brazo_features
     ])
 
-    return features
+    return np.round(features,4)
 
+
+# ==========================
+# CARGAR DATASET
+# ==========================
 
 def cargar_letras():
 
     letras = {}
 
-    with open('/Users/aleixbenet/Desktop/PRACTICA LIS/dataset_lse.csv','r',encoding='utf-8-sig') as f:
+    with open(DATASET_FILE,'r',encoding='utf-8-sig') as f:
 
         for linea in f:
 
-            linea = linea.strip()
+            valores = linea.strip().split(",")
 
-            if not linea:
+            if len(valores) != 73:
                 continue
 
-            letra = linea.split(",")[0]
+            letra = valores[0].strip().lower()
+            numeros = np.array(valores[1:],dtype=float)
 
-            numeros = [float(x) for x in linea.split(",")[1:]]
+            features = extraer_features(numeros)
 
-            if len(numeros) == 72:
-
-                features = extraer_features(numeros)
-
-                if letra not in letras:
-                    letras[letra] = []
-
-                letras[letra].append(features)
+            letras.setdefault(letra,[]).append(features)
 
     return letras
 
 
+# ==========================
+# CLASIFICADOR KNN
+# ==========================
+
 class Comparador:
 
-    def __init__(self,dataset):
-        self.refs = {letra: np.mean(muestras,axis=0) for letra,muestras in dataset.items()}
+    def __init__(self,dataset,k=5):
+
+        self.k = k
+
+        self.features = []
+        self.labels = []
+
+        for letra,muestras in dataset.items():
+
+            for f in muestras:
+                self.features.append(f)
+                self.labels.append(letra)
+
+        self.features = np.array(self.features)
+        self.labels = np.array(self.labels)
+
+        # normalización
+        self.mean = np.mean(self.features,axis=0)
+        self.std = np.std(self.features,axis=0)+1e-6
+
+        self.features = (self.features-self.mean)/self.std
+
 
     def comparar(self,vector):
 
         features = extraer_features(vector)
+        features = (features-self.mean)/self.std
+
+        # aplicar pesos
+        diff = (self.features - features) * FEATURE_WEIGHTS
+
+        dists = np.linalg.norm(diff,axis=1)
+
+        idx = np.argsort(dists)[:self.k]
+
+        vecinos = self.labels[idx]
+        distancias = dists[idx]
+
+        votos = {}
+
+        for letra,dist in zip(vecinos,distancias):
+
+            peso = 1/(dist+1e-6)
+
+            votos[letra] = votos.get(letra,0) + peso
+
+        total = sum(votos.values())
 
         resultados = {}
-        errores = {}
-        confianza_features = {}
 
-        for letra, ref in self.refs.items():
+        for letra in votos:
+            resultados[letra] = (votos[letra]/total)*100
 
-            dif = np.abs(features-ref)*PESOS_FEATURES
-            dist = np.linalg.norm(dif)
+        return resultados
 
-            resultados[letra] = max(0,100-dist*40)
 
-            confianza_features[letra] = [max(0,100-d*100) for d in dif]
+# ==========================
+# DETECTOR ESTABLE
+# ==========================
 
-            peor_idx = np.argmax(dif)
+class DetectorEstable:
 
-            errores[letra] = (NOMBRES_FEATURES[peor_idx], dif[peor_idx])
+    def __init__(self,confidence_threshold,stability_frames,cooldown_frames):
 
-        return resultados, errores, confianza_features
+        self.confidence_threshold = confidence_threshold
+        self.stability_frames = stability_frames
+        self.cooldown_frames = cooldown_frames
+
+        self.buffer = deque(maxlen=stability_frames)
+        self.cooldown = 0
+        self.ultima = None
+
+
+    def actualizar(self,resultados):
+
+        if not resultados:
+            return None,0
+
+        letra = max(resultados,key=resultados.get)
+        conf = resultados[letra]
+
+        if self.cooldown>0:
+            self.cooldown -= 1
+            return self.ultima,conf
+
+        if conf < self.confidence_threshold:
+            self.buffer.clear()
+            return None,conf
+
+        self.buffer.append(letra)
+
+        if len(self.buffer) < self.stability_frames:
+            return self.ultima,conf
+
+        conteo = Counter(self.buffer)
+
+        letra_estable = conteo.most_common(1)[0][0]
+
+        if letra_estable != self.ultima:
+
+            self.ultima = letra_estable
+            self.cooldown = self.cooldown_frames
+
+        return self.ultima,conf
+
+
+# ==========================
+# DIBUJAR BRAZO
+# ==========================
+
+def draw_arm(frame,results,w,h,arm_idx):
+
+    pts=[]
+
+    for i in arm_idx:
+
+        lm = results.pose_landmarks.landmark[i]
+
+        x = int(lm.x*w)
+        y = int(lm.y*h)
+
+        pts.append((x,y))
+
+    cv2.circle(frame,pts[0],10,(0,255,255),-1)
+    cv2.circle(frame,pts[1],10,(0,255,0),-1)
+    cv2.circle(frame,pts[2],10,(255,0,0),-1)
+
+    cv2.line(frame,pts[0],pts[1],(255,255,255),3)
+    cv2.line(frame,pts[1],pts[2],(255,255,255),3)
 
 
 # ==========================
@@ -178,34 +267,36 @@ print("Cargando dataset...")
 
 dataset = cargar_letras()
 
-if not dataset:
-    print("❌ No se pudieron cargar letras")
-    exit()
+print("Letras:",list(dataset.keys()))
+print("Total muestras:",sum(len(v) for v in dataset.values()))
 
-print("Letras disponibles:", list(dataset.keys()))
+comparador = Comparador(dataset,k=K_NEIGHBORS)
 
-comparador = Comparador(dataset)
-
-# ==========================
-# MEDIAPIPE
-# ==========================
+detector = DetectorEstable(
+    CONFIDENCE_THRESHOLD,
+    STABILITY_FRAMES,
+    COOLDOWN_FRAMES
+)
 
 mp_holistic = mp.solutions.holistic
 mp_draw = mp.solutions.drawing_utils
 
 cap = cv2.VideoCapture(0)
 
-buffer = deque(maxlen=9)
+buffer_temporal = deque(maxlen=TEMPORAL_SMOOTHING)
+
+fps=0
+t0=time.time()
 
 with mp_holistic.Holistic(
-        model_complexity=1,
-        min_detection_confidence=0.6,
-        min_tracking_confidence=0.6
+    model_complexity=1,
+    min_detection_confidence=0.6,
+    min_tracking_confidence=0.6
 ) as holistic:
 
     while True:
 
-        ret, frame = cap.read()
+        ret,frame = cap.read()
 
         if not ret:
             break
@@ -214,98 +305,77 @@ with mp_holistic.Holistic(
 
         h,w,_ = frame.shape
 
+        t1=time.time()
+        fps=0.9*fps+0.1*(1/(t1-t0+1e-6))
+        t0=t1
+
         rgb = cv2.cvtColor(frame,cv2.COLOR_BGR2RGB)
 
         results = holistic.process(rgb)
 
-        hand = None
-        arm_idx = []
-        flip_x = False
+        hand=None
+        arm_idx=[]
 
         if results.right_hand_landmarks:
-            hand = results.right_hand_landmarks
-            arm_idx = [12,14,16]
+            hand=results.right_hand_landmarks
+            arm_idx=[12,14,16]
 
         elif results.left_hand_landmarks:
-            hand = results.left_hand_landmarks
-            arm_idx = [11,13,15]
-            flip_x = True
+            hand=results.left_hand_landmarks
+            arm_idx=[11,13,15]
+
+        letra=None
+        confianza=0
 
         if hand and results.pose_landmarks:
 
-            brazo = []
-            pts = []
+            draw_arm(frame,results,w,h,arm_idx)
+
+            brazo=[]
 
             for i in arm_idx:
 
-                lm = results.pose_landmarks.landmark[i]
-                x = lm.x
-                #x = espejo_x(lm.x, flip_x)
-                y = lm.y
-                z = lm.z
+                lm=results.pose_landmarks.landmark[i]
+                brazo.extend([lm.x,lm.y,lm.z])
 
-                brazo.extend([x,y,z])
-
-                pts.append((int(x*w), int(y*h)))
-
-            cv2.circle(frame, pts[0], 12, (0,255,255), -1)
-            cv2.circle(frame, pts[1], 12, (0,255,0), -1)
-            cv2.circle(frame, pts[2], 12, (255,0,0), -1)
-
-            cv2.line(frame, pts[0], pts[1], (255,255,255), 4)
-            cv2.line(frame, pts[1], pts[2], (255,255,255), 4)
-
-            mano = []
+            mano=[]
 
             for lm in hand.landmark:
+                mano.extend([lm.x,lm.y,lm.z])
 
-                x = espejo_x(lm.x, flip_x)
+            vector=np.array(brazo+mano)
 
-                mano.extend([x,lm.y,lm.z])
+            buffer_temporal.append(vector)
 
-            vector = np.array(brazo+mano)
+            vector=np.mean(buffer_temporal,axis=0)
 
-            resultados, errores, confianza_features = comparador.comparar(vector)
+            resultados=comparador.comparar(vector)
 
-            mejor = max(resultados, key=resultados.get)
+            letra,confianza=detector.actualizar(resultados)
 
-            buffer.append(mejor)
+            mp_draw.draw_landmarks(frame,hand,mp_holistic.HAND_CONNECTIONS)
 
-            letra = max(set(buffer), key=buffer.count)
+        if letra:
 
             cv2.putText(frame,f"Letra: {letra}",(20,60),
                         cv2.FONT_HERSHEY_SIMPLEX,2,(0,255,0),3)
 
-            conf = resultados[mejor]
+        else:
 
-            cv2.putText(frame,f"Confianza: {conf:.1f}%",(20,100),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
+            cv2.putText(frame,"Buscando...",(20,60),
+                        cv2.FONT_HERSHEY_SIMPLEX,1.5,(0,0,255),3)
 
-            caracteristica,_ = errores[mejor]
+        cv2.putText(frame,f"Confianza: {confianza:.1f}%",(20,110),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(0,255,255),2)
 
-            cv2.putText(frame,f"Error principal: {caracteristica}",(20,130),
-                        cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,0,255),2)
+        cv2.putText(frame,f"FPS: {fps:.1f}",(w-140,30),
+                    cv2.FONT_HERSHEY_SIMPLEX,0.7,(255,255,255),2)
 
-            y=170
+        cv2.imshow("Detector LSE",frame)
 
-            for i,nombre in enumerate(NOMBRES_FEATURES):
+        key=cv2.waitKey(1)&0xFF
 
-                conf_val = confianza_features[mejor][i]
-
-                cv2.putText(frame,f"{nombre}: {conf_val:.0f}%",
-                            (20,y),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            0.45,
-                            (255,255,255),
-                            1)
-
-                y+=18
-
-            mp_draw.draw_landmarks(frame, hand, mp_holistic.HAND_CONNECTIONS)
-
-        cv2.imshow("Detector de Letras", frame)
-
-        if cv2.waitKey(1) == 27:
+        if key==27:
             break
 
 cap.release()
